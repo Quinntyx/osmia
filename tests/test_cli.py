@@ -12,6 +12,8 @@ def test_models_and_config_cli(tmp_path, capsys) -> None:
     output = capsys.readouterr().out
     assert "gpt-6.1-sol" in output
     assert "* gpt-6.1-sol" in output
+    assert "deepseek-v4.1-flash-1017" in output
+    assert "glm-5.3-flash" in output
 
     assert main(["config", "--config", str(path), "--json"]) == 0
     output = capsys.readouterr().out

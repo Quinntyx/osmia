@@ -24,6 +24,14 @@ DEFAULT_MODELS: dict[str, dict[str, Any]] = {
     "gpt-5.6-terra": {"provider": "codex", "model": "gpt-5.6-terra"},
     "gpt-5.6-luna": {"provider": "codex", "model": "gpt-5.6-luna"},
     "codex-auto-review": {"provider": "codex", "model": "codex-auto-review"},
+    "deepseek-v4.1-flash-1017": {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4.1-flash-1017",
+    },
+    "glm-5.3-flash": {
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.3-flash",
+    },
 }
 
 
