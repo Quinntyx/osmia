@@ -90,16 +90,15 @@ cannot select a provider.
 
 ```json
 {
-  "default_model": "gpt-5.1-codex",
+  "default_model": "gpt-6.1-sol",
   "models": {
-    "gpt-5.1-codex": { "provider": "codex", "model": "gpt-5.1-codex" },
-    "claude-sonnet-4.5": {
-      "provider": "openrouter",
-      "model": "anthropic/claude-sonnet-4.5"
-    }
+    "gpt-6.1-sol": { "provider": "codex", "model": "gpt-6.1-sol" },
+    "gpt-6-sol": { "provider": "codex", "model": "gpt-6-sol" }
   }
 }
 ```
+
+Add OpenRouter routes the same way, using a model ID from OpenRouter's live catalogue.
 
 ChatGPT Codex uses the Responses API over a WebSocket (`wss://.../backend-api/codex/responses`),
 including ChatGPT OAuth token refresh. OpenRouter uses its Chat Completions API over SSE.

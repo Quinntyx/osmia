@@ -13,15 +13,17 @@ from typing import Any
 
 SUPPORTED_PROVIDERS = ("openrouter", "codex")
 
+# Codex chat models verified from the local CLIProxyAPI /v1/models catalogue.
+# Image-only slugs are intentionally excluded from these chat defaults.
 DEFAULT_MODELS: dict[str, dict[str, Any]] = {
-    "gpt-5.1-codex": {"provider": "codex", "model": "gpt-5.1-codex"},
-    "gpt-5.1-codex-mini": {"provider": "codex", "model": "gpt-5.1-codex-mini"},
-    "gpt-5.1": {"provider": "codex", "model": "gpt-5.1"},
-    "claude-sonnet-4.5": {
-        "provider": "openrouter",
-        "model": "anthropic/claude-sonnet-4.5",
-    },
-    "gpt-4.1": {"provider": "openrouter", "model": "openai/gpt-4.1"},
+    "gpt-6.1-sol": {"provider": "codex", "model": "gpt-6.1-sol"},
+    "gpt-6-sol": {"provider": "codex", "model": "gpt-6-sol"},
+    "gpt-6-luna": {"provider": "codex", "model": "gpt-6-luna"},
+    "gpt-6-astra": {"provider": "codex", "model": "gpt-6-astra"},
+    "gpt-5.6-sol": {"provider": "codex", "model": "gpt-5.6-sol"},
+    "gpt-5.6-terra": {"provider": "codex", "model": "gpt-5.6-terra"},
+    "gpt-5.6-luna": {"provider": "codex", "model": "gpt-5.6-luna"},
+    "codex-auto-review": {"provider": "codex", "model": "codex-auto-review"},
 }
 
 
@@ -41,7 +43,7 @@ def default_config_data() -> dict[str, Any]:
     return {
         "host": "127.0.0.1",
         "port": 8765,
-        "default_model": "gpt-5.1-codex",
+        "default_model": "gpt-6.1-sol",
         "agent_port_count": 100,
         "agent_stale_seconds": 10,
         "models": json.loads(json.dumps(DEFAULT_MODELS)),

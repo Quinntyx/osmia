@@ -10,8 +10,8 @@ def test_models_and_config_cli(tmp_path, capsys) -> None:
     path = tmp_path / "config.json"
     assert main(["models", "--config", str(path)]) == 0
     output = capsys.readouterr().out
-    assert "gpt-5.1-codex" in output
-    assert "* gpt-5.1-codex" in output
+    assert "gpt-6.1-sol" in output
+    assert "* gpt-6.1-sol" in output
 
     assert main(["config", "--config", str(path), "--json"]) == 0
     output = capsys.readouterr().out
