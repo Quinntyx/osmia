@@ -58,6 +58,22 @@ result = osmia.Agent(
 print(result)
 ```
 
+## Chat
+
+`chat.py` at the repository root is a ready-made chat session. It gives the agent one
+tool: a minimal `bash` wrapper that runs a command with `bash -lc` and returns stdout and
+stderr together with the exit code — unlike `os.system`, which only reports the exit
+status and discards the output.
+
+With the proxy running (see above), start it from the repository root:
+
+```bash
+uv run chat.py
+```
+
+The session takes over the terminal, runs shell commands on request, and stays open for
+follow-up prompts until Ctrl+D.
+
 ## Tools
 
 Any Python callable can be a tool. Its docstring becomes the description and its type
