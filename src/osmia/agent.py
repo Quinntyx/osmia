@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -31,8 +32,10 @@ class Agent:
     """An agent with Python callables as tools and a live control endpoint.
 
     ``Agent(prompt="do the task", tools=[...]).run()`` is the whole happy path. While it
-    runs, the agent registers itself with the proxy and serves ``/state``,
-    ``/events``, ``/steer`` and ``/stop`` on a local port.
+    runs, the agent registers itself with the proxy and serves ``/state``, ``/events``,
+    ``/events.sse``, ``/prompt``, ``/steer`` and ``/stop`` on a local port, so a session
+    is fully drivable over HTTP: submit prompts, watch the event stream, steer, or stop.
+    Pass ``control_api=False`` to turn that surface off.
     """
 
     def __init__(
@@ -52,6 +55,8 @@ class Agent:
         client: ProxyClient | None = None,
         heartbeat: float = 2.0,
         max_tool_output: int = 200_000,
+        control_api: bool = True,
+        session: bool | None = None,
     ) -> None:
         self.id = "agent-" + uuid.uuid4().hex[:10]
         self.name = name or self.id
@@ -83,6 +88,12 @@ class Agent:
         self._stop = threading.Event()
         self._steering: list[str] = []
         self._steering_lock = threading.Lock()
+        self._inbox: queue.Queue[str] = queue.Queue()
+        self._awaiting = False
+        self._awaiting_lock = threading.Lock()
+        self._control_api = bool(control_api)
+        self._session_arg = session
+        self._session_active: bool | None = None
         self._running = False
         self.status = "idle"
         self.turns = 0
@@ -98,7 +109,12 @@ class Agent:
         seq = self.events.append(kind, payload)
         if self._tui is not None:
             self._tui.event(
-                {"seq": seq, "time": time.time(), "kind": kind, "payload": payload or {}}
+                {
+                    "seq": seq,
+                    "time": time.time(),
+                    "kind": kind,
+                    "payload": payload or {},
+                }
             )
         return seq
 
@@ -112,10 +128,6 @@ class Agent:
                 raise ValueError("Prompt must not be empty")
             self.prompt = text
             self.messages.append({"role": "user", "content": text})
-        if not any(message.get("role") == "user" for message in self.messages) and not (
-            self._interactive_tui(self._tui_arg)
-        ):
-            raise ValueError("Agent.run() needs a prompt")
         self._stop.clear()
         self._stop_notified = False
         self.status = "starting"
@@ -126,6 +138,12 @@ class Agent:
         self._tui = self._make_tui()
         try:
             self._start_discovery()
+            self._session_active = self._session_mode()
+            if not self._has_user_message() and not self._input_available():
+                raise ValueError(
+                    "Agent.run() needs a prompt unless the TUI or control API can "
+                    "supply one"
+                )
             if self._tui is not None:
                 self._tui.start(self, self.model)
                 if self.prompt:
@@ -167,9 +185,7 @@ class Agent:
             return self._tui_arg
         if self._tui_arg is False:
             return None
-        enabled = self._tui_arg is True or (
-            sys.stdin.isatty() and sys.stdout.isatty()
-        )
+        enabled = self._tui_arg is True or (sys.stdin.isatty() and sys.stdout.isatty())
         return TUI(enabled=enabled, verbose=self.verbose) if enabled else None
 
     @staticmethod
@@ -181,7 +197,45 @@ class Agent:
             return False
         return sys.stdin.isatty() and sys.stdout.isatty()
 
+    def _has_user_message(self) -> bool:
+        return any(message.get("role") == "user" for message in self.messages)
+
+    def _input_available(self) -> bool:
+        """True when a prompt can still arrive, from the TUI or the control API."""
+        if not self._inbox.empty():
+            return True
+        if isinstance(self._tui, TUI) and getattr(self._tui, "interactive", False):
+            return True
+        return self._control_api and self.attach_url is not None
+
+    def _session_mode(self) -> bool:
+        """True when the run keeps listening for prompts instead of returning.
+
+        Defaults to a session for a prompt-less start (the caller expects input from
+        the TUI or the control API) and for an interactive TUI, and to one shot when a
+        headless caller passed a prompt. ``Agent(session=True)`` forces a session so a
+        control plane can seed the first prompt and keep driving the same run.
+        """
+        if self._session_arg is not None:
+            return bool(self._session_arg)
+        if not self._has_user_message():
+            return True
+        return isinstance(self._tui, TUI) and getattr(self._tui, "interactive", False)
+
+    @property
+    def session(self) -> bool:
+        """True when this run waits for prompts instead of returning after a turn.
+
+        Resolved once per run so ``/state`` keeps reporting the mode the run is in,
+        even after the first user message makes the guess ambiguous.
+        """
+        if self._session_active is not None:
+            return self._session_active
+        return self._session_mode()
+
     def _start_discovery(self) -> None:
+        if not self._control_api:
+            return
         parsed = urlparse(self.proxy_url)
         proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
         start = proxy_port + 1
@@ -207,14 +261,10 @@ class Agent:
 
     def _loop(self) -> str:
         last_text = ""
-        interactive = bool(
-            self._tui is not None and getattr(self._tui, "interactive", False)
-        )
-        if interactive and not any(
-            message.get("role") == "user" for message in self.messages
-        ):
-            opening = self._tui.wait_for_followup()
-            if opening is None or self._stop.is_set():
+        session = self.session
+        if not self._has_user_message():
+            opening = self._await_prompt()
+            if opening is None:
                 return last_text
             self.messages.append({"role": "user", "content": opening})
         while True:
@@ -240,12 +290,12 @@ class Agent:
                 return last_text
             if not completed:
                 raise RuntimeError(f"Agent exceeded max_turns={self.max_turns}")
-            if not interactive:
+            if not session:
                 return last_text
             if self._steering_pending():
                 continue
-            followup = self._tui.wait_for_followup()
-            if followup is None or self._stop.is_set():
+            followup = self._await_prompt()
+            if followup is None:
                 return last_text
             self.messages.append({"role": "user", "content": followup})
 
@@ -263,9 +313,7 @@ class Agent:
         content: list[str] = []
         slots: dict[int, dict[str, Any]] = {}
         try:
-            stream = self._client.stream_chat(
-                self.messages, model=self.model, **kwargs
-            )
+            stream = self._client.stream_chat(self.messages, model=self.model, **kwargs)
             for chunk in stream:
                 for choice in chunk.get("choices") or []:
                     if choice.get("index", 0) != 0:
@@ -277,7 +325,9 @@ class Agent:
                         self._emit("assistant.delta", {"text": str(text)})
                     reasoning = delta.get("reasoning_content")
                     if reasoning and (self.verbose or self._tui is not None):
-                        self._emit("assistant.reasoning.delta", {"text": str(reasoning)})
+                        self._emit(
+                            "assistant.reasoning.delta", {"text": str(reasoning)}
+                        )
                     for raw_call in delta.get("tool_calls") or []:
                         index = int(raw_call.get("index", 0))
                         slot = slots.setdefault(
@@ -384,6 +434,62 @@ class Agent:
         with self._steering_lock:
             return bool(self._steering)
 
+    # ----------------------------------------------------------------- prompts
+    def submit(self, text: str) -> int:
+        """Queue a prompt from any surface (human or control API).
+
+        The prompt becomes the next user message at the next turn boundary, so it is
+        safe to call while a turn is running. Use ``steer(text)`` to influence the
+        turn that is already in flight instead of starting a follow-up turn.
+        """
+        message = str(text).strip()
+        if not message:
+            raise ValueError("Prompt text must not be empty")
+        self._inbox.put(message)
+        return self._emit(
+            "agent.prompt", {"text": message, "queued": self.pending_prompts}
+        )
+
+    @property
+    def awaiting_input(self) -> bool:
+        """True while the run is blocked waiting for a prompt."""
+        with self._awaiting_lock:
+            return self._awaiting
+
+    @property
+    def pending_prompts(self) -> int:
+        """Prompts submitted but not yet delivered to the conversation."""
+        return self._inbox.qsize()
+
+    @property
+    def stop_requested(self) -> bool:
+        """True once ``stop()`` (or Ctrl+C) asked the run to end."""
+        return self._stop.is_set()
+
+    def _set_awaiting(self, value: bool) -> None:
+        with self._awaiting_lock:
+            if self._awaiting == value:
+                return
+            self._awaiting = value
+        self._emit("agent.awaiting", {"awaiting": value})
+
+    def _await_prompt(self) -> str | None:
+        """Block until a prompt arrives from any input surface, or the run stops."""
+        self._set_awaiting(True)
+        try:
+            while not self._stop.is_set():
+                try:
+                    prompt = self._inbox.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                # Flip the flag before the prompt reaches the conversation so an
+                # observer that just submitted it never reads a stale "still waiting".
+                self._set_awaiting(False)
+                return prompt
+            return None
+        finally:
+            self._set_awaiting(False)
+
     def stop(self) -> None:
         self._stop.set()
         if not self._stop_notified:
@@ -406,6 +512,11 @@ class Agent:
             "turns": self.turns,
             "tool_names": [tool.name for tool in self.tools],
             "steering_queued": len(self._steering),
+            "prompts_queued": self.pending_prompts,
+            "awaiting_input": self.awaiting_input,
+            "accepts_prompts": self._input_available(),
+            "session": self.session,
+            "control_api": self._control_api,
             "last_event": self.events.last_seq,
             "last_error": self.last_error,
             "attach_url": self.attach_url,

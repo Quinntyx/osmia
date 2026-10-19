@@ -135,12 +135,50 @@ The agent's local HTTP surface is:
 | `GET /state` | Agent snapshot; `?messages=0` omits the conversation |
 | `GET /events?after=N` | Replayable JSON event log (also accepts `since=N`) |
 | `GET /events.json?after=N` | Alias for the JSON event log |
+| `GET /events.sse?after=N` | Server-Sent Events stream of the same log |
+| `POST /prompt` | `{"text": "..."}` submits a prompt: opens a prompt-less session, or queues the next user message |
 | `POST /steer` | `{"text": "..."}` queues a steering message |
 | `POST /stop` | Requests a graceful stop |
 
-The proxy exposes the live registry at `GET /v1/agents`, and can forward control with
-`POST /v1/agents/{id}/steer` and `POST /v1/agents/{id}/stop`. A control plane that uses these
-endpoints is intentionally out of scope.
+The proxy exposes the live registry at `GET /v1/agents`, and forwards control with
+`POST /v1/agents/{id}/prompt`, `POST /v1/agents/{id}/steer`, and `POST /v1/agents/{id}/stop`.
+
+## Control plane
+
+An agent is fully drivable over HTTP, so a GUI (or a script) needs no TTY and no prompt at
+startup. Start a prompt-less agent and drive it:
+
+```python
+import httpx
+
+from osmia import Agent
+
+agent = Agent(tools=[...], tui=False)   # no prompt: the control surface supplies one
+
+httpx.post(agent.attach_url + "/prompt", json={"text": "Summarise this repo."})
+agent.run()
+```
+
+```bash
+curl -s http://127.0.0.1:8765/v1/agents | jq        # discover agents and their attach URLs
+curl -sN "http://127.0.0.1:8768/events.sse" &      # live event stream
+curl -s -XPOST http://127.0.0.1:8768/prompt \
+  -H 'content-type: application/json' \
+  -d '{"text": "List the files in this directory."}'
+curl -s -XPOST http://127.0.0.1:8765/v1/agents/agent-1234/stop
+```
+
+A run is a *session* when it has no prompt at startup, when the TUI is interactive, or when
+`Agent(session=True)` is passed explicitly; otherwise it returns after the first settled
+turn. Sessions wait for the next prompt instead of exiting, which is what makes a control
+plane usable across several prompts. `Agent(session=False)` restores one-shot behaviour, and
+`Agent(control_api=False)` closes the control surface entirely.
+
+`GET /state` reports `session`, `accepts_prompts`, `awaiting_input`, and `prompts_queued` so a
+client knows when submitting a prompt will be honoured immediately, and the event stream
+publishes `agent.awaiting` on every transition. Prompts are delivered at turn boundaries
+alongside steering, so a submission never interrupts a running tool call, and `/stop` remains
+the only way to abandon a turn in flight at the next checkpoint.
 
 ## CLI
 

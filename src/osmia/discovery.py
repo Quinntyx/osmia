@@ -74,6 +74,41 @@ class AgentDiscovery:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _sse(self, after: int) -> None:
+                """Stream agent events as Server-Sent Events until the run ends."""
+                agent = discovery.agent
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                # HTTP/1.0 style close-delimited body: the client reads until EOF.
+                self.end_headers()
+                cursor = max(0, int(after))
+                idle = 0
+                try:
+                    while not discovery._stop.is_set() and not agent.stop_requested:
+                        events = agent.events.since(cursor, 200)
+                        if events:
+                            idle = 0
+                            payload = "".join(
+                                f"id: {event['seq']}\n"
+                                f"event: {event['kind']}\n"
+                                f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                                for event in events
+                            )
+                            self.wfile.write(payload.encode("utf-8"))
+                            self.wfile.flush()
+                            cursor = events[-1]["seq"]
+                        else:
+                            idle += 1
+                            if idle >= 40:  # heartbeat every ~10s
+                                idle = 0
+                                self.wfile.write(b": ping\n\n")
+                                self.wfile.flush()
+                        time.sleep(0.25)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
             def _body(self) -> dict[str, Any]:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b"{}"
@@ -94,24 +129,51 @@ class AgentDiscovery:
                         HTTPStatus.OK,
                         discovery.agent.state(include_messages=include),
                     )
+                elif parsed.path == "/events.sse":
+                    query = parse_qs(parsed.query)
+                    after = int((query.get("after") or query.get("since") or ["0"])[0])
+                    self._sse(after)
                 elif parsed.path in ("/events", "/events.json"):
                     query = parse_qs(parsed.query)
                     after = int((query.get("after") or query.get("since") or ["0"])[0])
                     limit = min(1000, int((query.get("limit") or ["200"])[0]))
                     self._json(
                         HTTPStatus.OK,
-                        {"object": "list", "data": discovery.agent.events.since(after, limit)},
+                        {
+                            "object": "list",
+                            "data": discovery.agent.events.since(after, limit),
+                        },
                     )
                 else:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "unknown route"})
 
             def do_POST(self) -> None:  # noqa: N802
                 path = urlparse(self.path).path
-                if path == "/steer":
+                if path == "/prompt":
                     payload = self._body()
                     text = str(payload.get("text") or "").strip()
                     if not text:
-                        self._json(HTTPStatus.BAD_REQUEST, {"error": "text is required"})
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "text is required"}
+                        )
+                        return
+                    seq = discovery.agent.submit(text)
+                    self._json(
+                        HTTPStatus.ACCEPTED,
+                        {
+                            "ok": True,
+                            "seq": seq,
+                            "queued": discovery.agent.pending_prompts,
+                            "awaiting_input": discovery.agent.awaiting_input,
+                        },
+                    )
+                elif path == "/steer":
+                    payload = self._body()
+                    text = str(payload.get("text") or "").strip()
+                    if not text:
+                        self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": "text is required"}
+                        )
                         return
                     seq = discovery.agent.steer(text)
                     self._json(HTTPStatus.OK, {"ok": True, "seq": seq})
@@ -124,13 +186,17 @@ class AgentDiscovery:
         try:
             self._server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         except OSError as exc:
-            raise RuntimeError(f"Cannot bind agent discovery port {port}: {exc}") from exc
+            raise RuntimeError(
+                f"Cannot bind agent discovery port {port}: {exc}"
+            ) from exc
         self._server.daemon_threads = True
         self.port = port
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         self.agent.events.append("discovery.start", {"url": self.url})
-        self._register_thread = threading.Thread(target=self._register_loop, daemon=True)
+        self._register_thread = threading.Thread(
+            target=self._register_loop, daemon=True
+        )
         self._register_thread.start()
 
     def _register_loop(self) -> None:

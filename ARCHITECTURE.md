@@ -47,12 +47,23 @@ calls). This avoids interrupting tool execution or leaving a malformed transcrip
 
 `tui=None` enables the terminal UI only when stdin and stdout are TTYs. The UI takes over
 an alternate screen (restored on exit), redraws a block transcript of user messages,
-assistant text, reasoning, tool calls, and tool results, and keeps a cooperative
-`select`-based stdin reader. When a turn settles the UI does not exit: it waits for a
-follow-up prompt that becomes the next user message, so a session stays open until the
-operator sends Ctrl+D or Ctrl+C. `Agent.run()` with no prompt is legal in that mode and
-opens straight into the prompt. Idle redraws are event-driven, so a waiting session does
-not busy-render. `tui=False` is quiet headless mode.
+assistant text, reasoning, and tool activity, and keeps a cooperative `select`-based stdin
+reader. Consecutive tool calls and results render as one rail-grouped panel
+(`╭─ ✓ tools done · 2/2`, `│ ● tool(args)`, `│   ↳ result`, `╰─`) so a burst of tool work
+reads as a single step; failures are detected from `exit code: N` and `Error…` prefixes and
+marked on the rail. When a turn settles the UI does not exit: it waits for a follow-up
+prompt that becomes the next user message, so a session stays open until the operator sends
+Ctrl+D or Ctrl+C. `Agent.run()` with no prompt is legal in that mode and opens straight into
+the prompt. Idle redraws are event-driven, so a waiting session does not busy-render.
+`tui=False` is quiet headless mode.
+
+Prompts reach the loop through one queue regardless of origin: the TUI submits to it, and so
+does `POST /prompt`. `Agent.submit(text)` is the programmatic form. A run is a *session* — it
+returns to the queue after each settled turn instead of returning to the caller — when it
+started without a prompt, when the TUI is interactive, or when `session=True` is passed;
+otherwise the first settled turn returns. The mode is resolved once per run so `/state`
+reports it consistently, and the `agent.awaiting` event marks every transition into and out
+of the waiting state (see `## Control plane` in the README for the wire surface).
 
 ## Tools
 
@@ -126,7 +137,9 @@ upstream prompt caching still works. Duplex steering over the Codex socket
 ## Discovery
 
 The agent chooses an open port by binding candidates from `proxy_port + 1` to
-`proxy_port + agent_port_count - 1`. The bound server exposes state, events, steering, and stop.
+`proxy_port + agent_port_count - 1`. The bound server exposes state, events (JSON and SSE),
+prompts, steering, and stop, so an agent can be started with no prompt and driven entirely
+over HTTP.
 
 Every two seconds the agent `PUT`s a compact snapshot to `/v1/agents/{id}` on the proxy.
 The proxy keeps the registry in memory, adds a `last_seen` timestamp and a `stale` flag, and
@@ -134,8 +147,12 @@ serves `GET /v1/agents`. On shutdown the agent sends `DELETE`. Registry failures
 by the agent beyond being recorded; they never fail an agent run.
 
 The event log is a bounded in-memory list with a monotonically increasing sequence number.
-`GET /events?after=N` (also `since=N`) returns JSON events for replay. Live control commands
-are forwarded to the agent's local `/steer` and `/stop` endpoints.
+`GET /events?after=N` (also `since=N`) returns JSON events for replay, and `GET /events.sse`
+streams the same events as Server-Sent Events with `id:`, `event:`, and `data:` frames plus a
+`: ping` comment on idle, so a browser or `EventSource` client can follow a run without
+polling. Live control commands are forwarded to the agent's local `/prompt`, `/steer`, and
+`/stop` endpoints; the proxy holds no prompt queue of its own, so a prompt either reaches the
+agent or fails visibly.
 
 ## Invariants
 

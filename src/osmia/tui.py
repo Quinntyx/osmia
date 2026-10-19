@@ -56,6 +56,22 @@ def _sanitize(text: str) -> str:
     return "".join(result)
 
 
+def _looks_failed(text: str) -> bool:
+    """Best-effort failure detection for tool output the UI did not run itself."""
+    stripped = str(text).strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("Error", "error:", "Traceback")):
+        return True
+    first = stripped.splitlines()[0]
+    if first.startswith("exit code:"):
+        try:
+            return int(first.split(":", 1)[1].strip()) != 0
+        except ValueError:
+            return first.startswith("exit code: timeout")
+    return False
+
+
 def _wrap(text: str, width: int) -> list[str]:
     width = max(1, width)
     result: list[str] = []
@@ -68,8 +84,10 @@ def _wrap(text: str, width: int) -> list[str]:
             take = 0
             used = 0
             for char in line:
-                char_width = 0 if unicodedata.combining(char) else (
-                    2 if unicodedata.east_asian_width(char) in "WF" else 1
+                char_width = (
+                    0
+                    if unicodedata.combining(char)
+                    else (2 if unicodedata.east_asian_width(char) in "WF" else 1)
                 )
                 if used + char_width > width:
                     break
@@ -121,7 +139,6 @@ class TUI:
         self._history_pos: int | None = None
         self._history_draft = ""
         self._followups: queue.Queue[str | None] = queue.Queue()
-        self._awaiting_followup = False
         self._last_size = (0, 0)
 
     # --------------------------------------------------------------- lifecycle
@@ -251,6 +268,10 @@ class TUI:
             )
         elif kind == "tool.result":
             self._add_block("tool_result", str(payload.get("result") or ""))
+        elif kind == "agent.prompt":
+            text = str(payload.get("text") or "")
+            if text:
+                self._add_block("user", text)
         elif kind == "agent.steer":
             self._add_block("steer", str(payload.get("text") or ""))
         elif kind == "agent.error":
@@ -266,29 +287,10 @@ class TUI:
         elif self.verbose and kind.startswith(("registry.", "discovery.")):
             self._add_block("info", f"[{kind}] {payload}")
 
-    # --------------------------------------------------------------- follow-up
-    def wait_for_followup(self) -> str | None:
-        if not self.enabled:
-            return None
-        with self._lock:
-            self._awaiting_followup = True
-        self._wake()
-        try:
-            while not self._stop.is_set():
-                agent_stop = getattr(self.agent, "_stop", None)
-                if agent_stop is not None and agent_stop.is_set():
-                    return None
-                try:
-                    return self._followups.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-            return None
-        finally:
-            with self._lock:
-                self._awaiting_followup = False
-            self._wake()
-
     # --------------------------------------------------------------- input
+    def _waiting_for_input(self) -> bool:
+        return bool(getattr(self.agent, "awaiting_input", False))
+
     def _read_loop(self) -> None:
         assert self._fd is not None
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -426,21 +428,17 @@ class TUI:
         self._cursor = 0
         self._history.append(text)
         self._history_pos = None
-        if self._awaiting_followup:
-            self._awaiting_followup = False
-            self._add_block("user", text)
-            self._followups.put(text)
-        else:
-            try:
+        try:
+            if self._waiting_for_input():
+                # The agent renders the user block from the agent.prompt event.
+                self.agent.submit(text)
+            else:
                 self.agent.steer(text)
-            except Exception:
-                pass
+        except Exception:
+            pass
         self._wake()
 
     def _interrupt(self) -> None:
-        if self._awaiting_followup:
-            self._awaiting_followup = False
-            self._followups.put(None)
         try:
             self.agent.stop()
         except Exception:
@@ -450,9 +448,6 @@ class TUI:
     def _eof(self) -> None:
         if self._line:
             return
-        if self._awaiting_followup:
-            self._awaiting_followup = False
-            self._followups.put(None)
         try:
             self.agent.stop()
         except Exception:
@@ -502,12 +497,88 @@ class TUI:
             if text:
                 blocks.append(_Block(self._stream_kind, text))
         lines: list[str] = []
-        for block in blocks:
-            lines.extend(self._block_lines(block, width))
+        index = 0
+        while index < len(blocks):
+            if blocks[index].kind in ("tool_call", "tool_result"):
+                group: list[_Block] = []
+                while index < len(blocks) and blocks[index].kind in (
+                    "tool_call",
+                    "tool_result",
+                ):
+                    group.append(blocks[index])
+                    index += 1
+                lines.extend(self._tool_group_lines(group, width))
+                continue
+            lines.extend(self._block_lines(blocks[index], width))
+            index += 1
         if len(lines) > height:
             hidden = len(lines) - (height - 1)
-            return [self._c(DIM, f"… {hidden} earlier lines")] + lines[-(height - 1):]
+            return [self._c(DIM, f"… {hidden} earlier lines")] + lines[-(height - 1) :]
         return lines
+
+    def _tool_group_lines(self, group: list[_Block], width: int) -> list[str]:
+        """Render consecutive tool blocks as one rail-grouped activity panel.
+
+        Consecutive ``tool_call``/``tool_result`` blocks become a single unit with a
+        header, a left rail per member, and a closing footer, so a burst of tool work
+        reads as one step instead of a bare list of lines.
+        """
+        calls = [block for block in group if block.kind == "tool_call"]
+        results = [block for block in group if block.kind == "tool_result"]
+        done = len(results)
+        failed = sum(1 for block in results if _looks_failed(block.text))
+        total = len(calls) or done
+        if done >= total:
+            glyph, label = "✓", "tools done"
+            head_color = GREEN if not failed else RED
+        else:
+            glyph, label = "✻", "tools running"
+            head_color = YELLOW
+        count = f" · {done}/{total}" if total else ""
+        failure = f" · {failed} failed" if failed else ""
+        lines = [self._c(head_color, f"╭─ {glyph} {label}{count}{failure}")]
+
+        rail = self._c(DIM, "│ ")
+        pending = iter(results)
+        result = None
+        for call in calls:
+            for line in _wrap(call.text, width - 4):
+                lines.append(rail + self._c(YELLOW, "● " + line))
+            try:
+                result = next(pending)
+            except StopIteration:
+                result = None
+            if result is None:
+                continue
+            lines.extend(self._tool_result_lines(result.text, width, rail))
+        for leftover in pending:  # a result with no recorded call
+            lines.extend(self._tool_result_lines(leftover.text, width, rail))
+        lines.append(self._c(DIM, "╰─"))
+        return lines
+
+    def _tool_result_lines(self, text: str, width: int, rail: str) -> list[str]:
+        lines = _wrap(text, width - 6)
+        limit = 60 if self.verbose else 24
+        diff = text.startswith("diff --git") or any(
+            line.startswith(("+++ ", "--- ", "@@ ")) for line in lines[:20]
+        )
+        failed = _looks_failed(text)
+        out: list[str] = []
+        for position, line in enumerate(lines[:limit]):
+            prefix = "" if position else ("✗ " if failed else "↳ ")
+            if diff and line.startswith("+") and not line.startswith("+++"):
+                out.append(rail + self._c(GREEN, "  " + prefix + line))
+            elif diff and line.startswith("-") and not line.startswith("---"):
+                out.append(rail + self._c(RED, "  " + prefix + line))
+            elif diff and line.startswith("@@"):
+                out.append(rail + self._c(CYAN, "  " + prefix + line))
+            elif failed:
+                out.append(rail + self._c(RED, "  " + prefix + line))
+            else:
+                out.append(rail + self._c(DIM, "  " + prefix + line))
+        if len(lines) > limit:
+            out.append(rail + self._c(DIM, f"    … {len(lines) - limit} more lines"))
+        return out
 
     def _block_lines(self, block: _Block, width: int) -> Iterable[str]:
         kind = block.kind
@@ -527,23 +598,8 @@ class TUI:
             for line in _wrap(block.text, width - 2):
                 yield self._c(YELLOW, "● " + line)
         elif kind == "tool_result":
-            yield self._c(DIM + BOLD, "  ↳ result")
-            lines = _wrap(block.text, width - 2)
-            limit = 60 if self.verbose else 24
-            diff = block.text.startswith("diff --git") or any(
-                line.startswith(("+++ ", "--- ", "@@ ")) for line in lines[:20]
-            )
-            for line in lines[:limit]:
-                if diff and line.startswith("+") and not line.startswith("+++"):
-                    yield self._c(GREEN, "  " + line)
-                elif diff and line.startswith("-") and not line.startswith("---"):
-                    yield self._c(RED, "  " + line)
-                elif diff and line.startswith("@@"):
-                    yield self._c(CYAN, "  " + line)
-                else:
-                    yield self._c(DIM, "  " + line)
-            if len(lines) > limit:
-                yield self._c(DIM, f"  … {len(lines) - limit} more lines")
+            for line in self._tool_result_lines(block.text, width, ""):
+                yield line
         elif kind == "turn":
             yield self._c(DIM, f"── {block.text} ──")
         elif kind == "steer":
@@ -561,14 +617,15 @@ class TUI:
         model = self.model or "(proxy default)"
         turns = getattr(agent, "turns", 0)
         status = getattr(agent, "status", "?")
-        if self._awaiting_followup:
+        waiting = self._waiting_for_input()
+        if waiting:
             state = "waiting for input"
         elif status == "running":
             state = "working"
         else:
             state = str(status)
         left = f" Osmia · {model} · turn {turns}"
-        if self._awaiting_followup:
+        if waiting:
             hint = "Enter send · Ctrl+D exit"
         elif status == "running":
             hint = "Enter steer · Ctrl+C stop"
@@ -577,7 +634,11 @@ class TUI:
         right = f"{state} · {hint} " if hint else f"{state} "
         if _display_width(left) + _display_width(right) >= width:
             right = f"{state} "
-        text = left + " " * max(1, width - _display_width(left) - _display_width(right)) + right
+        text = (
+            left
+            + " " * max(1, width - _display_width(left) - _display_width(right))
+            + right
+        )
         return self._c(REVERSE, text[:width])
 
     def _input_line(self, width: int) -> tuple[str, int]:
@@ -586,11 +647,11 @@ class TUI:
         line = "".join(self._line)
         available = max(1, width - prompt_width)
         start = 0
-        while _display_width(line[start:self._cursor]) >= available:
+        while _display_width(line[start : self._cursor]) >= available:
             start += 1
         visible = line[start:]
         if _display_width(visible) > available:
             visible = visible[: max(1, available)]
-        cursor_col = 1 + prompt_width + _display_width(line[start:self._cursor])
+        cursor_col = 1 + prompt_width + _display_width(line[start : self._cursor])
         cursor_col = min(max(1, cursor_col), width)
         return self._c(CYAN + BOLD, prompt) + visible, cursor_col

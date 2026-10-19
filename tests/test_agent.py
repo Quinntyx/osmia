@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,13 @@ from osmia.agent import Agent
 from osmia.proxy.config import Config
 from osmia.proxy.server import Proxy
 from osmia.tui import TUI
-from tests.helpers import ScriptedProvider, text_chunks, tool_chunks
+from tests.helpers import (
+    ScriptedProvider,
+    drive_prompts,
+    text_chunks,
+    tool_chunks,
+    wait_until,
+)
 
 
 def make_proxy(tmp_path: Path, provider: ScriptedProvider) -> Proxy:
@@ -25,7 +33,11 @@ def make_proxy(tmp_path: Path, provider: ScriptedProvider) -> Proxy:
             "openrouter": {"api_key": None},
         },
     }
-    return Proxy(config=Config(tmp_path / "config.json", data), port=0, providers={"codex": provider}).start()
+    return Proxy(
+        config=Config(tmp_path / "config.json", data),
+        port=0,
+        providers={"codex": provider},
+    ).start()
 
 
 def test_agent_tool_loop_end_to_end(tmp_path) -> None:
@@ -176,6 +188,38 @@ def test_discovery_state_events_steer_stop_and_registry(tmp_path) -> None:
         assert events
         assert any(event["kind"] == "agent.steer" for event in events)
 
+        response = httpx.post(
+            discovery_url + "/prompt",
+            json={"text": "direct prompt"},
+        )
+        assert response.status_code == 202
+        assert response.json()["queued"] == 1
+        assert agent.pending_prompts == 1
+
+        assert (
+            httpx.post(discovery_url + "/prompt", json={"text": ""}).status_code == 400
+        )
+
+        response = httpx.post(
+            proxy.url + f"/v1/agents/{agent.id}/prompt",
+            json={"text": "forwarded prompt"},
+        )
+        assert response.status_code == 202
+        assert response.json()["action"] == "prompt"
+        assert agent.pending_prompts == 2
+        assert (
+            httpx.post(
+                proxy.url + "/v1/agents/ghost/prompt", json={"text": "x"}
+            ).status_code
+            == 404
+        )
+
+        kinds = [
+            event["kind"]
+            for event in httpx.get(discovery_url + "/events.json").json()["data"]
+        ]
+        assert kinds.count("agent.prompt") == 2
+
         response = httpx.post(proxy.url + f"/v1/agents/{agent.id}/stop", json={})
         assert response.status_code == 200
         assert agent._stop.is_set()
@@ -185,45 +229,76 @@ def test_discovery_state_events_steer_stop_and_registry(tmp_path) -> None:
         proxy.stop()
 
 
+class QuietTUI(TUI):
+    """Interactive UI stub that records transcript blocks instead of drawing them."""
+
+    interactive = True
+
+    def __init__(self) -> None:
+        super().__init__(enabled=False)
+        self.seen: list[str] = []
+        self.blocks: list[tuple[str, str]] = []
+
+    def start(self, agent: Any, model: str | None) -> None:
+        self.agent = agent
+
+    def stop(self) -> None:
+        return None
+
+    def event(self, event: dict[str, Any]) -> None:
+        payload = event.get("payload") or {}
+        if event.get("kind") == "agent.prompt":
+            self.blocks.append(("user", str(payload.get("text") or "")))
+
+    def user_message(self, text: str) -> None:
+        self.seen.append(text)
+
+
+def test_tui_submit_routes_prompts_and_steering() -> None:
+    class StubAgent:
+        def __init__(self, awaiting: bool) -> None:
+            self.awaiting_input = awaiting
+            self.submitted: list[str] = []
+            self.steered: list[str] = []
+
+        def submit(self, text: str) -> int:
+            self.submitted.append(text)
+            return 1
+
+        def steer(self, text: str) -> int:
+            self.steered.append(text)
+            return 1
+
+    waiting = StubAgent(True)
+    tui = TUI(enabled=False)
+    tui.agent = waiting
+    tui._line = list("follow-up prompt")
+    tui._submit()
+    assert waiting.submitted == ["follow-up prompt"]
+    assert waiting.steered == []
+
+    busy = StubAgent(False)
+    tui.agent = busy
+    tui._line = list("steer this way")
+    tui._submit()
+    assert busy.steered == ["steer this way"]
+    assert busy.submitted == []
+
+
 def test_interactive_tui_accepts_followup_prompts(tmp_path) -> None:
-    class FollowupTUI(TUI):
-        interactive = True
-
-        def __init__(self) -> None:
-            super().__init__(enabled=False)
-            self.followups = ["Actually answer second.", None]
-            self.seen: list[str] = []
-
-        def start(self, agent: Any, model: str | None) -> None:
-            self.agent = agent
-
-        def stop(self) -> None:
-            return None
-
-        def event(self, event: dict[str, Any]) -> None:
-            return None
-
-        def user_message(self, text: str) -> None:
-            self.seen.append(text)
-
-        def wait_for_followup(self) -> str | None:
-            return self.followups.pop(0)
-
     provider = ScriptedProvider([text_chunks("first"), text_chunks("second")])
     proxy = make_proxy(tmp_path, provider)
-    tui = FollowupTUI()
-    agent = Agent(
-        model="fake",
-        proxy_url=proxy.url,
-        tui=tui,
-        agent_port_count=20,
-    )
+    tui = QuietTUI()
+    agent = Agent(model="fake", proxy_url=proxy.url, tui=tui, agent_port_count=20)
+    driver = drive_prompts(agent, ["Actually answer second."])
     try:
         assert agent.run("Say something.") == "second"
     finally:
+        driver.join(5)
         proxy.stop()
 
     assert tui.seen == ["Say something."]
+    assert tui.blocks == [("user", "Actually answer second.")]
     assert [message["role"] for message in agent.messages] == [
         "user",
         "assistant",
@@ -235,45 +310,109 @@ def test_interactive_tui_accepts_followup_prompts(tmp_path) -> None:
     assert agent.turns == 2
 
 
-def test_interactive_tui_can_open_without_prompt(tmp_path) -> None:
-    class OpeningTUI(TUI):
-        interactive = True
-
-        def __init__(self) -> None:
-            super().__init__(enabled=False)
-            self.followups = ["What is 2 + 3?", None]
-
-        def start(self, agent: Any, model: str | None) -> None:
-            self.agent = agent
-
-        def stop(self) -> None:
-            return None
-
-        def event(self, event: dict[str, Any]) -> None:
-            return None
-
-        def wait_for_followup(self) -> str | None:
-            return self.followups.pop(0)
-
-    provider = ScriptedProvider([text_chunks("five")])
+def test_promptless_headless_run_is_driven_over_rest(tmp_path) -> None:
+    provider = ScriptedProvider([text_chunks("first"), text_chunks("second")])
     proxy = make_proxy(tmp_path, provider)
-    agent = Agent(model="fake", proxy_url=proxy.url, tui=OpeningTUI())
+    agent = Agent(model="fake", proxy_url=proxy.url, tui=False, agent_port_count=20)
+    result: dict[str, str] = {}
+
+    def worker() -> None:
+        result["text"] = agent.run()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
     try:
-        assert agent.run() == "five"
+        wait_until(lambda: agent.attach_url is not None)
+        wait_until(lambda: agent.awaiting_input)
+        control = str(agent.attach_url)
+
+        state = httpx.get(control + "/state").json()
+        assert state["accepts_prompts"] is True
+        assert state["awaiting_input"] is True
+        assert state["prompts_queued"] == 0
+
+        first = httpx.post(control + "/prompt", json={"text": "Say something."})
+        assert first.status_code == 202
+        assert first.json()["ok"] is True
+        wait_until(lambda: len(provider.requests) == 1)
+        wait_until(lambda: agent.awaiting_input)
+
+        second = httpx.post(control + "/prompt", json={"text": "Say it again."})
+        assert second.status_code == 202
+        wait_until(lambda: len(provider.requests) == 2)
+        wait_until(lambda: agent.awaiting_input)
+
+        assert httpx.post(control + "/prompt", json={"text": "  "}).status_code == 400
+        httpx.post(control + "/stop")
+        thread.join(5)
     finally:
         proxy.stop()
 
-    assert provider.requests[0]["messages"][-1]["content"] == "What is 2 + 3?"
-    assert agent.messages == [
-        {"role": "user", "content": "What is 2 + 3?"},
-        {"role": "assistant", "content": "five"},
+    assert not thread.is_alive()
+    assert result["text"] == "second"
+    assert agent.awaiting_input is False
+    assert [message["role"] for message in agent.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
     ]
+    assert agent.messages[2]["content"] == "Say it again."
+    kinds = [event["kind"] for event in agent.events.snapshot()]
+    assert "agent.prompt" in kinds
+    assert "agent.awaiting" in kinds
+
+
+def test_events_sse_streams_events(tmp_path) -> None:
+    provider = ScriptedProvider([text_chunks("streamed over sse")])
+    proxy = make_proxy(tmp_path, provider)
+    agent = Agent(model="fake", proxy_url=proxy.url, tui=False, agent_port_count=20)
+
+    def worker() -> None:
+        agent.run()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    events: list[dict[str, Any]] = []
+    ids: list[str] = []
+    try:
+        wait_until(lambda: agent.awaiting_input)
+        with httpx.stream(
+            "GET", str(agent.attach_url) + "/events.sse", timeout=20
+        ) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            agent.submit("Say something.")
+            for line in response.iter_lines():
+                if line.startswith("id: "):
+                    ids.append(line[4:])
+                elif line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+                    if (
+                        len([e for e in events if e["kind"] == "assistant.message"])
+                        >= 1
+                    ):
+                        break
+        agent.stop()
+        thread.join(5)
+    finally:
+        proxy.stop()
+
+    assert not thread.is_alive()
+    kinds = [event["kind"] for event in events]
+    assert "agent.prompt" in kinds
+    assert "turn.start" in kinds
+    assert "assistant.delta" in kinds
+    assert ids and ids == sorted(ids, key=int)
+    assert [event["seq"] for event in events] == sorted(
+        event["seq"] for event in events
+    )
 
 
 def test_agent_without_prompt_requires_interactive_tui(tmp_path) -> None:
     provider = ScriptedProvider([text_chunks("unused")])
     proxy = make_proxy(tmp_path, provider)
-    agent = Agent(model="fake", proxy_url=proxy.url, tui=False)
+    agent = Agent(model="fake", proxy_url=proxy.url, tui=False, control_api=False)
     try:
         try:
             agent.run()
@@ -284,3 +423,4 @@ def test_agent_without_prompt_requires_interactive_tui(tmp_path) -> None:
     finally:
         proxy.stop()
     assert provider.requests == []
+    assert agent.attach_url is None

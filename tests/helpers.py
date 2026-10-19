@@ -16,7 +16,9 @@ def text_chunks(text: str, model: str = "fake") -> list[dict[str, Any]]:
             "object": "chat.completion.chunk",
             "created": 1,
             "model": model,
-            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+            "choices": [
+                {"index": 0, "delta": {"content": text}, "finish_reason": None}
+            ],
         },
         {
             "id": "chatcmpl-test",
@@ -97,7 +99,9 @@ class ScriptedProvider(Provider):
         self.on_request = None
         self._lock = threading.Lock()
 
-    def stream(self, route: ModelRoute, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    def stream(
+        self, route: ModelRoute, payload: dict[str, Any]
+    ) -> Iterator[dict[str, Any]]:
         with self._lock:
             index = len(self.requests)
             self.requests.append(payload)
@@ -109,3 +113,51 @@ class ScriptedProvider(Provider):
 
     def close(self) -> None:
         return None
+
+
+def wait_until(predicate: Any, timeout: float = 10.0, what: str = "condition") -> None:
+    """Spin until ``predicate()`` is truthy; fail loudly instead of hanging a test."""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"{what} not met within {timeout}s")
+
+
+def drive_prompts(
+    agent: Any, prompts: list[str], timeout: float = 10.0
+) -> threading.Thread:
+    """Submit ``prompts`` whenever the agent waits for input, then stop the run.
+
+    Thread failures are recorded on ``thread.errors`` so a stuck driver cannot be
+    mistaken for a stalled agent.
+    """
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            for text in prompts:
+                wait_until(
+                    lambda: agent.awaiting_input, timeout, "agent awaiting input"
+                )
+                turns = agent.turns
+                agent.submit(text)
+                # Wait on observable progress, not on the awaiting flag, which may
+                # still read True in the instant before the prompt is picked up.
+                wait_until(
+                    lambda: agent.turns > turns or agent.stop_requested,
+                    timeout,
+                    "follow-up turn to run",
+                )
+            wait_until(lambda: agent.awaiting_input, timeout, "agent awaiting input")
+            agent.stop()
+        except Exception as exc:  # pragma: no cover - surfaced by the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.errors = errors  # type: ignore[attr-defined]
+    thread.start()
+    return thread

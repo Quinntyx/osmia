@@ -21,7 +21,7 @@ from ..providers import Provider, ProviderStreamError, provider_for
 from .config import Config, ModelRoute
 
 MAX_BODY = 32 * 1024 * 1024
-AGENT_RE = re.compile(r"^/v1/agents/([A-Za-z0-9_.:-]+)(?:/(steer|stop))?$")
+AGENT_RE = re.compile(r"^/v1/agents/([A-Za-z0-9_.:-]+)(?:/(steer|stop|prompt))?$")
 
 
 class ProxyError(RuntimeError):
@@ -30,9 +30,7 @@ class ProxyError(RuntimeError):
         self.status = status
 
 
-def aggregate_stream(
-    chunks: Iterator[dict[str, Any]], model: str
-) -> dict[str, Any]:
+def aggregate_stream(chunks: Iterator[dict[str, Any]], model: str) -> dict[str, Any]:
     """Collect OpenAI streaming chunks into one Chat Completions response."""
     content: list[str] = []
     reasoning: list[str] = []
@@ -92,7 +90,8 @@ def aggregate_stream(
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
+                "finish_reason": finish_reason
+                or ("tool_calls" if tool_calls else "stop"),
             }
         ],
         "usage": usage
@@ -242,7 +241,9 @@ class Proxy:
             self.agent_events.pop(agent_id, None)
             self.steering.pop(agent_id, None)
 
-    def event_snapshot(self, agent_id: str | None, after: int, limit: int) -> list[dict[str, Any]]:
+    def event_snapshot(
+        self, agent_id: str | None, after: int, limit: int
+    ) -> list[dict[str, Any]]:
         if agent_id:
             log = self.agent_events.get(agent_id)
             if log is None:
@@ -265,7 +266,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
+        )
         self.send_header("Access-Control-Max-Age", "600")
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
@@ -401,7 +404,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(400, "`id` is required")
             return
         state = self.proxy.register_agent(str(agent_id), payload)
-        self._send_json(HTTPStatus.OK, {"ok": True, "id": state["id"], "port": state.get("port")})
+        self._send_json(
+            HTTPStatus.OK, {"ok": True, "id": state["id"], "port": state.get("port")}
+        )
 
     def _forward(self, attach_url: str, action: str, body: dict[str, Any]) -> bool:
         try:
@@ -434,10 +439,31 @@ class _Handler(BaseHTTPRequestHandler):
             return
         text = str(payload.get("text") or "").strip()
         if not text:
-            self._error(400, "Steering message text is required")
+            self._error(
+                400,
+                "Prompt text is required"
+                if action == "prompt"
+                else "Steering message text is required",
+            )
+            return
+        if action == "prompt":
+            # A prompt is a new user turn, so it must reach the agent itself; there is
+            # no proxy-side queue that could replay it later.
+            if not attach_url:
+                self._error(409, "Agent has no control endpoint to receive a prompt")
+                return
+            if not self._forward(str(attach_url), "prompt", {"text": text}):
+                self._error(502, "Agent control endpoint is unreachable")
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {"ok": True, "action": "prompt", "forwarded": True},
+            )
             return
         if attach_url and self._forward(str(attach_url), "steer", {"text": text}):
-            self._send_json(HTTPStatus.OK, {"ok": True, "action": "steer", "forwarded": True})
+            self._send_json(
+                HTTPStatus.OK, {"ok": True, "action": "steer", "forwarded": True}
+            )
             return
         seq = self.proxy.agent_events.setdefault(agent_id, EventLog()).append(
             "steer.queued", {"text": text}
