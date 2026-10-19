@@ -112,7 +112,9 @@ class Agent:
                 raise ValueError("Prompt must not be empty")
             self.prompt = text
             self.messages.append({"role": "user", "content": text})
-        if not any(message.get("role") == "user" for message in self.messages):
+        if not any(message.get("role") == "user" for message in self.messages) and not (
+            self._interactive_tui(self._tui_arg)
+        ):
             raise ValueError("Agent.run() needs a prompt")
         self._stop.clear()
         self._stop_notified = False
@@ -126,6 +128,8 @@ class Agent:
             self._start_discovery()
             if self._tui is not None:
                 self._tui.start(self, self.model)
+                if self.prompt:
+                    self._tui.user_message(self.prompt)
             self.status = "running"
             self._emit(
                 "agent.start",
@@ -168,6 +172,15 @@ class Agent:
         )
         return TUI(enabled=enabled, verbose=self.verbose) if enabled else None
 
+    @staticmethod
+    def _interactive_tui(tui: Any) -> bool:
+        """True when the configured UI can accept prompts typed by a human."""
+        if isinstance(tui, TUI):
+            return bool(getattr(tui, "interactive", False))
+        if tui is False:
+            return False
+        return sys.stdin.isatty() and sys.stdout.isatty()
+
     def _start_discovery(self) -> None:
         parsed = urlparse(self.proxy_url)
         proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -194,25 +207,47 @@ class Agent:
 
     def _loop(self) -> str:
         last_text = ""
-        for turn in range(1, self.max_turns + 1):
-            if self._stop.is_set():
+        interactive = bool(
+            self._tui is not None and getattr(self._tui, "interactive", False)
+        )
+        if interactive and not any(
+            message.get("role") == "user" for message in self.messages
+        ):
+            opening = self._tui.wait_for_followup()
+            if opening is None or self._stop.is_set():
+                return last_text
+            self.messages.append({"role": "user", "content": opening})
+        while True:
+            completed = False
+            for _ in range(self.max_turns):
+                if self._stop.is_set():
+                    break
+                self._drain_steering()
+                self.turns += 1
+                self._emit("turn.start", {"turn": self.turns})
+                text, calls = self._turn()
+                last_text = text
+                if self._stop.is_set():
+                    break
+                if calls:
+                    self._execute_tools(calls)
+                    continue
+                if self._steering_pending():
+                    continue
+                completed = True
                 break
-            self._drain_steering()
-            self.turns = turn
-            self._emit("turn.start", {"turn": turn})
-            text, calls = self._turn()
-            last_text = text
             if self._stop.is_set():
-                break
-            if calls:
-                self._execute_tools(calls)
-                continue
+                return last_text
+            if not completed:
+                raise RuntimeError(f"Agent exceeded max_turns={self.max_turns}")
+            if not interactive:
+                return last_text
             if self._steering_pending():
                 continue
-            return text
-        if self._stop.is_set():
-            return last_text
-        raise RuntimeError(f"Agent exceeded max_turns={self.max_turns}")
+            followup = self._tui.wait_for_followup()
+            if followup is None or self._stop.is_set():
+                return last_text
+            self.messages.append({"role": "user", "content": followup})
 
     # --------------------------------------------------------------- one turn
     def _turn(self) -> tuple[str, list[ToolCall]]:
@@ -241,7 +276,7 @@ class Agent:
                         content.append(str(text))
                         self._emit("assistant.delta", {"text": str(text)})
                     reasoning = delta.get("reasoning_content")
-                    if reasoning and self.verbose:
+                    if reasoning and (self.verbose or self._tui is not None):
                         self._emit("assistant.reasoning.delta", {"text": str(reasoning)})
                     for raw_call in delta.get("tool_calls") or []:
                         index = int(raw_call.get("index", 0))

@@ -18,9 +18,13 @@ osmia.Agent(
 ).run()
 ```
 
-`Agent.run()` returns the final assistant text. When stdin and stdout are a TTY it also
-renders a small streaming terminal UI with cooperative steering. Pass `tui=False` for quiet,
-headless execution, or call `agent.run("another prompt")` to continue a conversation.
+`Agent.run()` returns the final assistant text. When stdin and stdout are a TTY it takes
+over the screen (alternate mode) and renders a streaming transcript with tool calls,
+reasoning, and diff-colored results. Turns do not end the session: after the model
+settles, type another prompt and it becomes the next user message, so the conversation
+keeps going until Ctrl+D (exit) or Ctrl+C (stop). Typing while a turn is running queues
+cooperative steering instead. Pass `tui=False` for quiet, headless execution, or call
+`agent.run("another prompt")` to continue a conversation programmatically.
 
 ## Install
 

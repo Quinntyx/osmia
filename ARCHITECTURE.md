@@ -45,9 +45,14 @@ Steering is cooperative: `Agent.steer(text)` and `POST /steer` queue a user mess
 delivered at the next safe boundary (after the current upstream response or after its tool
 calls). This avoids interrupting tool execution or leaving a malformed transcript.
 
-`tui=None` enables the terminal UI only when stdin and stdout are TTYs. The UI streams
-assistant text, shows tool calls and results, and runs a `select`-based stdin reader for
-steering. `tui=False` is quiet headless mode.
+`tui=None` enables the terminal UI only when stdin and stdout are TTYs. The UI takes over
+an alternate screen (restored on exit), redraws a block transcript of user messages,
+assistant text, reasoning, tool calls, and tool results, and keeps a cooperative
+`select`-based stdin reader. When a turn settles the UI does not exit: it waits for a
+follow-up prompt that becomes the next user message, so a session stays open until the
+operator sends Ctrl+D or Ctrl+C. `Agent.run()` with no prompt is legal in that mode and
+opens straight into the prompt. Idle redraws are event-driven, so a waiting session does
+not busy-render. `tui=False` is quiet headless mode.
 
 ## Tools
 

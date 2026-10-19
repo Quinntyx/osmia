@@ -9,6 +9,7 @@ import httpx
 from osmia.agent import Agent
 from osmia.proxy.config import Config
 from osmia.proxy.server import Proxy
+from osmia.tui import TUI
 from tests.helpers import ScriptedProvider, text_chunks, tool_chunks
 
 
@@ -182,3 +183,104 @@ def test_discovery_state_events_steer_stop_and_registry(tmp_path) -> None:
         agent._discovery.stop()
         agent._discovery = None
         proxy.stop()
+
+
+def test_interactive_tui_accepts_followup_prompts(tmp_path) -> None:
+    class FollowupTUI(TUI):
+        interactive = True
+
+        def __init__(self) -> None:
+            super().__init__(enabled=False)
+            self.followups = ["Actually answer second.", None]
+            self.seen: list[str] = []
+
+        def start(self, agent: Any, model: str | None) -> None:
+            self.agent = agent
+
+        def stop(self) -> None:
+            return None
+
+        def event(self, event: dict[str, Any]) -> None:
+            return None
+
+        def user_message(self, text: str) -> None:
+            self.seen.append(text)
+
+        def wait_for_followup(self) -> str | None:
+            return self.followups.pop(0)
+
+    provider = ScriptedProvider([text_chunks("first"), text_chunks("second")])
+    proxy = make_proxy(tmp_path, provider)
+    tui = FollowupTUI()
+    agent = Agent(
+        model="fake",
+        proxy_url=proxy.url,
+        tui=tui,
+        agent_port_count=20,
+    )
+    try:
+        assert agent.run("Say something.") == "second"
+    finally:
+        proxy.stop()
+
+    assert tui.seen == ["Say something."]
+    assert [message["role"] for message in agent.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert agent.messages[2]["content"] == "Actually answer second."
+    assert provider.requests[1]["messages"][-1]["content"] == "Actually answer second."
+    assert agent.turns == 2
+
+
+def test_interactive_tui_can_open_without_prompt(tmp_path) -> None:
+    class OpeningTUI(TUI):
+        interactive = True
+
+        def __init__(self) -> None:
+            super().__init__(enabled=False)
+            self.followups = ["What is 2 + 3?", None]
+
+        def start(self, agent: Any, model: str | None) -> None:
+            self.agent = agent
+
+        def stop(self) -> None:
+            return None
+
+        def event(self, event: dict[str, Any]) -> None:
+            return None
+
+        def wait_for_followup(self) -> str | None:
+            return self.followups.pop(0)
+
+    provider = ScriptedProvider([text_chunks("five")])
+    proxy = make_proxy(tmp_path, provider)
+    agent = Agent(model="fake", proxy_url=proxy.url, tui=OpeningTUI())
+    try:
+        assert agent.run() == "five"
+    finally:
+        proxy.stop()
+
+    assert provider.requests[0]["messages"][-1]["content"] == "What is 2 + 3?"
+    assert agent.messages == [
+        {"role": "user", "content": "What is 2 + 3?"},
+        {"role": "assistant", "content": "five"},
+    ]
+
+
+def test_agent_without_prompt_requires_interactive_tui(tmp_path) -> None:
+    provider = ScriptedProvider([text_chunks("unused")])
+    proxy = make_proxy(tmp_path, provider)
+    agent = Agent(model="fake", proxy_url=proxy.url, tui=False)
+    try:
+        try:
+            agent.run()
+        except ValueError as exc:
+            assert "needs a prompt" in str(exc)
+        else:
+            raise AssertionError("run() without a prompt should fail headless")
+    finally:
+        proxy.stop()
+    assert provider.requests == []
